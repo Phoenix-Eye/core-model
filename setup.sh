@@ -1,36 +1,36 @@
 #!/bin/bash
 
 # Create root directory and main subdirectories
-mkdir -p phoenixeye/{data/{raw,processed},models/saved,src/{data,models,utils},notebooks,scripts,tests}
+mkdir -p {data/{raw,processed},models/saved,src/{data,models,utils},notebooks,scripts,tests}
 
 # Create empty files
-touch phoenixeye/requirements.txt
-touch phoenixeye/README.md
+touch requirements.txt
+touch README.md
 
 # Create Python files
-touch phoenixeye/src/__init__.py
-touch phoenixeye/src/config.py
-touch phoenixeye/src/data/__init__.py
-touch phoenixeye/src/data/collector.py
-touch phoenixeye/src/data/processor.py
-touch phoenixeye/src/models/__init__.py
-touch phoenixeye/src/models/layers.py
-touch phoenixeye/src/models/losses.py
-touch phoenixeye/src/models/wildfire_model.py
-touch phoenixeye/src/utils/__init__.py
-touch phoenixeye/src/utils/metrics.py
-touch phoenixeye/tests/__init__.py
+touch src/__init__.py
+touch src/config.py
+touch src/data/__init__.py
+touch src/data/collector.py
+touch src/data/processor.py
+touch src/models/__init__.py
+touch src/models/layers.py
+touch src/models/losses.py
+touch src/models/wildfire_model.py
+touch src/utils/__init__.py
+touch src/utils/metrics.py
+touch tests/__init__.py
 
 # Create notebook files
-touch phoenixeye/notebooks/data_exploration.ipynb
-touch phoenixeye/notebooks/model_evaluation.ipynb
+touch notebooks/data_exploration.ipynb
+touch notebooks/model_evaluation.ipynb
 
 # Create script files
-touch phoenixeye/scripts/train.py
-touch phoenixeye/scripts/predict.py
+touch scripts/train.py
+touch scripts/predict.py
 
 # Write requirements to requirements.txt
-cat << 'EOF' > phoenixeye/requirements.txt
+cat << 'EOF' > requirements.txt
 tensorflow>=2.8.0
 tensorflow-probability>=0.16.0
 earthengine-api>=0.1.317
@@ -47,7 +47,7 @@ pytest>=7.0.0
 EOF
 
 # Set appropriate permissions
-chmod +x phoenixeye/scripts/*.py
+chmod +x scripts/*.py
 
 # Print success message
 echo "Project structure created successfully!"
