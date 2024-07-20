@@ -11,27 +11,26 @@ class WildfireDataCollector:
         """Initialize the data collector with geographic bounds"""
         self.bounds = region_bounds
         
+        # Check if we're in sample mode
+        if os.path.exists('.using_sample_data'):
+            print("📝 Using sample data mode (Earth Engine access not configured)")
+            self.sample_mode = True
+            return
+        
         # Initialize Earth Engine with error handling
         try:
             ee.Initialize()
-        except:
-            # Try authenticating if not initialized
-            try:
-                ee.Authenticate()
-                ee.Initialize()
-            except Exception as e:
-                print("⚠️  Could not authenticate with Earth Engine. Switching to sample data mode.")
-                print(f"Error: {str(e)}")
-                self.sample_mode = True
-                return
-        
-        self.sample_mode = False
-        self.region = ee.Geometry.Rectangle([
-            region_bounds['lon_min'],
-            region_bounds['lat_min'],
-            region_bounds['lon_max'],
-            region_bounds['lat_max']
-        ])
+            self.sample_mode = False
+            self.region = ee.Geometry.Rectangle([
+                region_bounds['lon_min'],
+                region_bounds['lat_min'],
+                region_bounds['lon_max'],
+                region_bounds['lat_max']
+            ])
+        except Exception as e:
+            print(f"⚠️  Earth Engine error: {str(e)}")
+            print("📝 Falling back to sample data mode")
+            self.sample_mode = True
 
     
     def get_modis_data(self, start_date: str, end_date: str) -> ee.ImageCollection:
@@ -84,7 +83,11 @@ class WildfireDataCollector:
         return ee.ImageCollection('ESA/WorldCover/v100').first()
 
     def collect_all_data(self, start_date: str, end_date: str) -> Dict:
-        """Collect all required data and save locally"""
+        """Collect all required data"""
+        if self.sample_mode:
+            print("Generating sample data...")
+            return self._generate_sample_data()
+        
         print("Collecting remote sensing data...")
         data = {
             'modis': self.get_modis_data(start_date, end_date),
