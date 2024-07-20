@@ -19,6 +19,8 @@ class WildfireDataCollector:
         
         # Initialize Earth Engine with error handling
         try:
+            ee.Authenticate()
+            ee.Initialize(project='donativehub')
             ee.Initialize()
             self.sample_mode = False
             self.region = ee.Geometry.Rectangle([

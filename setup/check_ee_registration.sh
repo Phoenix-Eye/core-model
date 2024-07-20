@@ -36,7 +36,8 @@ ask_for_registration() {
 python << EOF
 import ee
 try:
-    ee.Initialize()
+    ee.Authenticate()
+    ee.Initialize(project='donativehub')
     print("✅ Earth Engine access verified!")
     exit(0)
 except Exception as e:
