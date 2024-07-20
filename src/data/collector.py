@@ -10,13 +10,29 @@ class WildfireDataCollector:
     def __init__(self, region_bounds: Dict[str, float]):
         """Initialize the data collector with geographic bounds"""
         self.bounds = region_bounds
+        
+        # Initialize Earth Engine with error handling
+        try:
+            ee.Initialize()
+        except:
+            # Try authenticating if not initialized
+            try:
+                ee.Authenticate()
+                ee.Initialize()
+            except Exception as e:
+                print("⚠️  Could not authenticate with Earth Engine. Switching to sample data mode.")
+                print(f"Error: {str(e)}")
+                self.sample_mode = True
+                return
+        
+        self.sample_mode = False
         self.region = ee.Geometry.Rectangle([
             region_bounds['lon_min'],
             region_bounds['lat_min'],
             region_bounds['lon_max'],
             region_bounds['lat_max']
         ])
-        ee.Initialize()
+
     
     def get_modis_data(self, start_date: str, end_date: str) -> ee.ImageCollection:
         """Fetch MODIS data"""
