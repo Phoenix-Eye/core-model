@@ -20,7 +20,7 @@ An advanced machine learning system designed to forecast the spread of wildfires
 - Images represent geospatial and temporal data
 - Data normalized and split: 80% training, 20% validation
 
-#### Performance Metrics
+#### Random Forest Performance Metrics
 
 | Metric | Value |
 |--------|--------|
