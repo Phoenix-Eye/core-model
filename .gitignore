@@ -174,3 +174,6 @@ dmypy.json
 *.tar.gz
 *.rar
 *.7z
+
+# Earth Engine json
+earth_engine.json
