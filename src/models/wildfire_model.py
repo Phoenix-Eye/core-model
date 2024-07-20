@@ -1,10 +1,15 @@
 import tensorflow as tf
-from tensorflow.keras import layers, Model, Input
+from tensorflow.keras import layers, Model, Input, backend as K
 from tensorflow.keras.applications import ResNet50V2
 from tensorflow.keras.optimizers import Adam
 import tensorflow_probability as tfp
 from typing import List, Tuple, Dict, Optional
 import numpy as np
+from sklearn.metrics import precision_recall_fscore_support, roc_auc_score
+from typing import Dict, List, Tuple, Optional, Any
+import time
+import json
+from pathlib import Path
 
 from .layers import (
     SpatialAttentionLayer,
@@ -299,3 +304,193 @@ class WildfirePredictionModel:
             )
             for i in range(num_models)
         ]
+    
+    def advanced_fit(
+        self,
+        x: List[np.ndarray],
+        y: np.ndarray,
+        validation_data: Optional[Tuple] = None,
+        target_accuracy: float = 0.90,
+        max_epochs: int = 1000,
+        patience: int = 20,
+        min_delta: float = 0.001,
+        **kwargs
+    ) -> Dict[str, Any]:
+        """
+        Enhanced training loop with adaptive learning and metrics tracking.
+        """
+        training_stats = {
+            'total_epochs': 0,
+            'best_accuracy': 0.0,
+            'training_time': 0,
+            'model_metrics': [],
+            'learning_curves': {
+                'accuracy': [],
+                'loss': [],
+                'val_accuracy': [],
+                'val_loss': []
+            }
+        }
+        
+        start_time = time.time()
+        best_weights = None
+        best_val_accuracy = 0.0
+        epochs_without_improvement = 0
+        
+        for epoch in range(max_epochs):
+            epoch_metrics = []
+            
+            # Train each ensemble member
+            for i, model in enumerate(self.models):
+                print(f"\nTraining model {i+1}/{self.num_ensemble} - Epoch {epoch+1}/{max_epochs}")
+                
+                # Train for one epoch
+                history = model.fit(
+                    x=x,
+                    y=y,
+                    validation_data=validation_data,
+                    epochs=1,
+                    verbose=1,
+                    callbacks=self._get_callbacks(),
+                    **kwargs
+                )
+                
+                # Collect metrics
+                metrics = {
+                    'loss': history.history['loss'][-1],
+                    'accuracy': history.history['accuracy'][-1]
+                }
+                
+                if validation_data:
+                    metrics.update({
+                        'val_loss': history.history['val_loss'][-1],
+                        'val_accuracy': history.history['val_accuracy'][-1]
+                    })
+                
+                epoch_metrics.append(metrics)
+            
+            # Calculate ensemble metrics
+            avg_metrics = self._calculate_ensemble_metrics(epoch_metrics)
+            training_stats['model_metrics'].append(avg_metrics)
+            
+            # Update learning curves
+            for key in ['accuracy', 'loss', 'val_accuracy', 'val_loss']:
+                if key in avg_metrics:
+                    training_stats['learning_curves'][key].append(avg_metrics[key])
+            
+            # Check for improvement
+            current_val_accuracy = avg_metrics.get('val_accuracy', avg_metrics['accuracy'])
+            
+            if current_val_accuracy > best_val_accuracy + min_delta:
+                best_val_accuracy = current_val_accuracy
+                epochs_without_improvement = 0
+                best_weights = [model.get_weights() for model in self.models]
+            else:
+                epochs_without_improvement += 1
+            
+            # Early stopping check
+            if epochs_without_improvement >= patience:
+                print(f"\nEarly stopping triggered after {epoch + 1} epochs")
+                break
+            
+            # Target accuracy check
+            if current_val_accuracy >= target_accuracy:
+                print(f"\nReached target accuracy of {target_accuracy}")
+                break
+            
+            # Adjust learning rate if needed
+            if epochs_without_improvement > patience // 2:
+                self._adjust_learning_rate(0.5)
+        
+        # Restore best weights
+        if best_weights:
+            for model, weights in zip(self.models, best_weights):
+                model.set_weights(weights)
+        
+        # Calculate final metrics
+        final_metrics = self._calculate_final_metrics(x, y, validation_data)
+        training_stats.update({
+            'total_epochs': epoch + 1,
+            'best_accuracy': best_val_accuracy,
+            'training_time': time.time() - start_time,
+            'final_metrics': final_metrics
+        })
+        
+        # Save training stats
+        self._save_training_stats(training_stats)
+        
+        return training_stats
+    
+    def _calculate_ensemble_metrics(self, metrics_list: List[Dict]) -> Dict:
+        """Calculate average metrics across ensemble"""
+        avg_metrics = {}
+        for key in metrics_list[0].keys():
+            avg_metrics[key] = np.mean([m[key] for m in metrics_list])
+        return avg_metrics
+    
+    def _calculate_final_metrics(
+        self,
+        x: List[np.ndarray],
+        y: np.ndarray,
+        validation_data: Optional[Tuple]
+    ) -> Dict:
+        """Calculate comprehensive final metrics"""
+        # Make predictions
+        y_pred, uncertainties = self.predict(x, return_uncertainty=True)
+        y_pred_binary = (y_pred > 0.5).astype(int)
+        
+        # Calculate metrics
+        precision, recall, f1, _ = precision_recall_fscore_support(
+            y.flatten(),
+            y_pred_binary.flatten(),
+            average='binary'
+        )
+        
+        roc_auc = roc_auc_score(y.flatten(), y_pred.flatten())
+        
+        metrics = {
+            'precision': float(precision),
+            'recall': float(recall),
+            'f1_score': float(f1),
+            'roc_auc': float(roc_auc),
+            'mean_uncertainty': float(np.mean(uncertainties))
+        }
+        
+        # Validation metrics if available
+        if validation_data:
+            val_pred, val_unc = self.predict(
+                [validation_data[0][0], validation_data[0][1]],
+                return_uncertainty=True
+            )
+            val_pred_binary = (val_pred > 0.5).astype(int)
+            
+            val_precision, val_recall, val_f1, _ = precision_recall_fscore_support(
+                validation_data[1].flatten(),
+                val_pred_binary.flatten(),
+                average='binary'
+            )
+            
+            metrics.update({
+                'val_precision': float(val_precision),
+                'val_recall': float(val_recall),
+                'val_f1_score': float(val_f1),
+                'val_uncertainty': float(np.mean(val_unc))
+            })
+        
+        return metrics
+    
+    def _adjust_learning_rate(self, factor: float):
+        """Adjust learning rate for all models"""
+        for model in self.models:
+            current_lr = K.get_value(model.optimizer.learning_rate)
+            new_lr = current_lr * factor
+            K.set_value(model.optimizer.learning_rate, new_lr)
+            print(f"\nReducing learning rate to {new_lr}")
+    
+    def _save_training_stats(self, stats: Dict):
+        """Save training statistics to file"""
+        save_path = Path(self.config['log_dir']) / 'training_stats.json'
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        with open(save_path, 'w') as f:
+            json.dump(stats, f, indent=2)
