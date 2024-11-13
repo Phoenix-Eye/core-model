@@ -1,15 +1,34 @@
 import tensorflow as tf
-from tensorflow.keras import layers, Model, Input, backend as K
-from tensorflow.keras.applications import ResNet50V2
+from tensorflow import keras
+from keras import (
+    layers, 
+    Model, 
+    Input, 
+    backend as K, 
+    mixed_precision
+)
+from tensorflow.keras.applications.resnet_v2 import ResNet50V2
 from tensorflow.keras.optimizers import Adam
+from tensorflow.distribute import MirroredStrategy
 import tensorflow_probability as tfp
-from typing import List, Tuple, Dict, Optional
 import numpy as np
-from sklearn.metrics import precision_recall_fscore_support, roc_auc_score
-from typing import Dict, List, Tuple, Optional, Any
+from sklearn.metrics import (
+    precision_recall_fscore_support,
+    roc_auc_score
+)
+from typing import List, Tuple, Dict, Optional, Any
 import time
 import json
 from pathlib import Path
+from .layers import (
+    SpatialAttentionLayer,
+    TemporalAttentionLayer,
+    SpatioTemporalAttention,
+    UncertaintyLayer,
+    ResidualConvLSTM2D,
+    FeatureFusion
+)
+from .losses import WildfirePredictionLoss, UncertaintyLoss
 
 from .layers import (
     SpatialAttentionLayer,
@@ -40,7 +59,25 @@ class WildfirePredictionModel:
         uncertainty: bool = True,
         transfer_learning: bool = True
     ):
-        self.config = config
+        # GPU and memory optimization setup
+        if tf.config.list_physical_devices('GPU'):
+            # Enable mixed precision
+            policy = tf.keras.mixed_precision.Policy('mixed_float16')
+            tf.keras.mixed_precision.set_global_policy(policy)
+            
+            # Memory growth
+            gpus = tf.config.list_physical_devices('GPU')
+            for gpu in gpus:
+                tf.config.experimental.set_memory_growth(gpu, True)
+        
+        # Enable XLA optimization
+        tf.config.optimizer.set_jit(True)
+        
+        # Initialize as before
+        if isinstance(config, dict) and 'model' in config:
+            self.config = config['model']
+        else:
+            self.config = config
         self.num_ensemble = num_ensemble
         self.uncertainty = uncertainty
         self.transfer_learning = transfer_learning
@@ -54,26 +91,38 @@ class WildfirePredictionModel:
             base_model = ResNet50V2(
                 include_top=False,
                 weights='imagenet',
-                input_shape=self.config['input_shape'][1:]
+                input_shape=self.config['input_shape'][1:],
+                dtype='float16'  # Use mixed precision
             )
             # Freeze early layers
             for layer in base_model.layers[:100]:
                 layer.trainable = False
+                
+            # Add spatial reduction layers for memory efficiency
+            x = base_model.output
+            x = layers.GlobalAveragePooling2D()(x)
+            x = layers.Dense(512, activation='relu', dtype='float16')(x)
+            
+            return Model(base_model.input, x)
         else:
-            # Custom feature extraction if not using transfer learning
+            # Custom feature extraction
             inputs = Input(shape=self.config['input_shape'][1:])
-            x = layers.Conv2D(64, (7, 7), strides=2, padding='same')(inputs)
+            
+            # Initial reduction
+            x = layers.Conv2D(64, (7, 7), strides=2, padding='same', dtype='float16')(inputs)
             x = layers.BatchNormalization()(x)
             x = layers.Activation('relu')(x)
             x = layers.MaxPooling2D((3, 3), strides=2, padding='same')(x)
             
-            # Add residual blocks
-            for filters in [64, 128, 256]:
-                x = self._residual_block(x, filters)
+            # Residual blocks with progressive downsampling
+            for filters in [64, 128, 256, 512]:
+                x = self._residual_block(x, filters, downsample=True)
             
-            base_model = Model(inputs, x)
+            # Global pooling
+            x = layers.GlobalAveragePooling2D()(x)
+            x = layers.Dense(512, activation='relu', dtype='float16')(x)
             
-        return base_model
+            return Model(inputs, x)
         
     def _residual_block(self, x: tf.Tensor, filters: int) -> tf.Tensor:
         """
@@ -194,59 +243,81 @@ class WildfirePredictionModel:
         **kwargs
     ) -> List[Dict]:
         """
-        Trains all models in the ensemble.
+        Trains all models in the ensemble with gradient accumulation.
         """
-        histories = []
-        for i, model in enumerate(self.models):
-            print(f"\nTraining model {i+1}/{self.num_ensemble}")
-            history = model.fit(
-                x=x,
-                y=y,
-                validation_data=validation_data,
-                callbacks=self._get_callbacks(),
-                **kwargs
-            )
-            histories.append(history.history)
-            
-        return histories
+        # Calculate accumulation steps based on virtual batch size
+        virtual_batch_size = 256 
+        actual_batch_size = kwargs.get('batch_size', 32)
+        accumulation_steps = virtual_batch_size // actual_batch_size
+        
+        strategies = tf.distribute.MirroredStrategy()
+        with strategies.scope():
+            histories = []
+            for i, model in enumerate(self.models):
+                print(f"\nTraining model {i+1}/{self.num_ensemble}")
+                
+                history = self.train_with_gradient_accumulation(
+                    x=x,
+                    y=y,
+                    accumulation_steps=accumulation_steps,
+                    validation_data=validation_data,
+                    callbacks=self._get_callbacks(),
+                    **kwargs
+                )
+                histories.append(history)
+                
+            return histories
         
     def predict(
         self,
         x: List[np.ndarray],
-        return_uncertainty: bool = True
+        return_uncertainty: bool = True,
+        batch_size: int = 16
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Makes predictions with uncertainty estimation using the ensemble.
+        Makes memory-efficient predictions with uncertainty estimation.
         """
+        # Calculate number of batches
+        total_samples = len(x[0])
+        num_batches = (total_samples + batch_size - 1) // batch_size
+        
         predictions = []
         uncertainties = []
         
-        # Get predictions from each model
-        for model in self.models:
+        # Predict in batches
+        for batch_idx in range(num_batches):
+            start_idx = batch_idx * batch_size
+            end_idx = min((batch_idx + 1) * batch_size, total_samples)
+            
+            batch_x = [x_i[start_idx:end_idx] for x_i in x]
+            
+            batch_predictions = []
+            batch_uncertainties = []
+            
+            for model in self.models:
+                if self.uncertainty:
+                    pred, unc = model.predict(batch_x, batch_size=batch_size)
+                    batch_predictions.append(pred)
+                    batch_uncertainties.append(unc)
+                else:
+                    pred = model.predict(batch_x, batch_size=batch_size)
+                    batch_predictions.append(pred)
+            
+            predictions.append(np.mean(batch_predictions, axis=0))
             if self.uncertainty:
-                pred, unc = model.predict(x)
-                predictions.append(pred)
-                uncertainties.append(unc)
-            else:
-                pred = model.predict(x)
-                predictions.append(pred)
-                
-        # Calculate ensemble statistics
-        mean_prediction = np.mean(predictions, axis=0)
+                uncertainties.append(
+                    np.mean(batch_uncertainties, axis=0) + 
+                    np.var(batch_predictions, axis=0)
+                )
         
-        if return_uncertainty:
-            if self.uncertainty:
-                # Combine model uncertainty and data uncertainty
-                epistemic_uncertainty = np.var(predictions, axis=0)
-                aleatoric_uncertainty = np.mean(uncertainties, axis=0)
-                total_uncertainty = epistemic_uncertainty + aleatoric_uncertainty
-            else:
-                # Use only ensemble variance as uncertainty
-                total_uncertainty = np.var(predictions, axis=0)
-                
-            return mean_prediction, total_uncertainty
+        # Concatenate batches
+        final_predictions = np.concatenate(predictions, axis=0)
         
-        return mean_prediction
+        if return_uncertainty and uncertainties:
+            final_uncertainties = np.concatenate(uncertainties, axis=0)
+            return final_predictions, final_uncertainties
+            
+        return final_predictions
         
     def _get_callbacks(self) -> List:
         """
@@ -494,3 +565,53 @@ class WildfirePredictionModel:
         
         with open(save_path, 'w') as f:
             json.dump(stats, f, indent=2)
+
+    def train_with_gradient_accumulation(
+        self,
+        x: List[np.ndarray],
+        y: np.ndarray,
+        accumulation_steps: int = 4,
+        **kwargs
+    ) -> Any:
+        """Training step with gradient accumulation"""
+        
+        @tf.function
+        def accumulate_gradients(x_batch, y_batch, model):
+            # Initialize gradient accumulator
+            accumulated_gradients = [
+                tf.zeros_like(var) 
+                for var in model.trainable_variables
+            ]
+            
+            # Split batch for accumulation
+            batch_size = tf.shape(x_batch[0])[0]
+            split_size = batch_size // accumulation_steps
+            
+            total_loss = 0.0
+            
+            for i in range(accumulation_steps):
+                start_idx = i * split_size
+                end_idx = (i + 1) * split_size
+                
+                x_micro = [x[start_idx:end_idx] for x in x_batch]
+                y_micro = y_batch[start_idx:end_idx]
+                
+                with tf.GradientTape() as tape:
+                    predictions = model(x_micro, training=True)
+                    loss = self.loss_fn(y_micro, predictions)
+                    scaled_loss = loss / accumulation_steps
+                
+                gradients = tape.gradient(
+                    scaled_loss, 
+                    model.trainable_variables
+                )
+                
+                # Accumulate gradients
+                accumulated_gradients = [
+                    accum_grad + grad
+                    for accum_grad, grad in zip(accumulated_gradients, gradients)
+                ]
+                
+                total_loss += scaled_loss
+                
+            return accumulated_gradients, total_loss

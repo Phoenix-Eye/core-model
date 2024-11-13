@@ -1,5 +1,5 @@
 import tensorflow as tf
-from tensorflow.keras import layers
+from keras import layers
 import tensorflow.keras.backend as K
 from typing import Tuple, Optional
 

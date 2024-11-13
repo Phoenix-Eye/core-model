@@ -1,4 +1,4 @@
-tensorflow>=2.8.0
+tensorflow>=2.16.0
 tf-keras>=2.15.0
 tensorflow-probability[tf]>=0.16.0
 earthengine-api>=0.1.317
@@ -13,3 +13,4 @@ seaborn>=0.11.0
 jupyter>=1.0.0
 nbformat>=5.7.0
 pytest>=7.0.0
+tqdm>=4.65.0

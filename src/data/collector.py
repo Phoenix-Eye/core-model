@@ -5,40 +5,50 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Tuple
 import os
 from pathlib import Path
+import concurrent.futures
+from tqdm import tqdm
+import logging
 
 class WildfireDataCollector:
-    def __init__(self, region_bounds: Dict[str, float]):
-        """Initialize the data collector with geographic bounds"""
-        self.bounds = region_bounds
+    def __init__(self, config):
+        """Initialize the data collector with configuration"""
+        self.config = config
+        self.regions = config['data'].processing_regions
+        self.main_bounds = config['data'].default_region_bounds()
         
-        # Check if we're in sample mode
-        if os.path.exists('.using_sample_data'):
-            print("📝 Using sample data mode (Earth Engine access not configured)")
-            self.sample_mode = True
-            return
+        # Setup logging
+        logging.basicConfig(level=logging.INFO)
+        self.logger = logging.getLogger(__name__)
         
-        # Initialize Earth Engine with error handling
+        # Initialize Earth Engine
         try:
-            ee.Authenticate()
-            ee.Initialize(project='donativehub')
             ee.Initialize()
             self.sample_mode = False
-            self.region = ee.Geometry.Rectangle([
-                region_bounds['lon_min'],
-                region_bounds['lat_min'],
-                region_bounds['lon_max'],
-                region_bounds['lat_max']
+            # Create geometry for full Mexico
+            self.full_region = ee.Geometry.Rectangle([
+                self.main_bounds['lon_min'],
+                self.main_bounds['lat_min'],
+                self.main_bounds['lon_max'],
+                self.main_bounds['lat_max']
             ])
+            # Create geometries for each region
+            self.region_geometries = {
+                name: ee.Geometry.Rectangle([
+                    bounds['lon_min'],
+                    bounds['lat_min'],
+                    bounds['lon_max'],
+                    bounds['lat_max']
+                ])
+                for name, bounds in self.regions.items()
+            }
         except Exception as e:
-            print(f"⚠️  Earth Engine error: {str(e)}")
-            print("📝 Falling back to sample data mode")
+            self.logger.error(f"Earth Engine initialization failed: {str(e)}")
             self.sample_mode = True
 
-    
-    def get_modis_data(self, start_date: str, end_date: str) -> ee.ImageCollection:
-        """Fetch MODIS data"""
+    def get_modis_data(self, start_date: str, end_date: str, region: ee.Geometry) -> ee.ImageCollection:
+        """Fetch MODIS data for a specific region"""
         modis_collection = ee.ImageCollection('MODIS/006/MOD09GA') \
-            .filterBounds(self.region) \
+            .filterBounds(region) \
             .filterDate(start_date, end_date)
         
         def calculate_indices(image):
@@ -47,133 +57,167 @@ class WildfireDataCollector:
             
         return modis_collection.map(calculate_indices)
 
-    def get_viirs_data(self, start_date: str, end_date: str) -> ee.ImageCollection:
-        """Fetch VIIRS active fire data"""
+    def get_viirs_data(self, start_date: str, end_date: str, region: ee.Geometry) -> ee.ImageCollection:
+        """Fetch VIIRS active fire data for a specific region"""
         return ee.ImageCollection('NOAA/VIIRS/001/VNP14A1') \
-            .filterBounds(self.region) \
+            .filterBounds(region) \
             .filterDate(start_date, end_date)
-    
-    def get_gedi_canopy(self) -> ee.Image:
-        """Fetch GEDI canopy height data"""
-        return ee.ImageCollection('LARSE/GEDI/GEDI02_A_002_MONTHLY') \
-            .filterBounds(self.region) \
-            .first() \
-            .select('rh98')
-    
-    def get_era5_weather(self, start_date: str, end_date: str) -> ee.ImageCollection:
-        """Fetch ERA5 weather data"""
+
+    def get_era5_weather(self, start_date: str, end_date: str, region: ee.Geometry) -> ee.ImageCollection:
+        """Fetch ERA5 weather data for a specific region"""
         return ee.ImageCollection('ECMWF/ERA5/HOURLY') \
-            .filterBounds(self.region) \
+            .filterBounds(region) \
             .filterDate(start_date, end_date) \
-            .select([
-                'temperature_2m',
-                'relative_humidity_2m',
-                'u_component_of_wind_10m',
-                'v_component_of_wind_10m',
-                'total_precipitation'
-            ])
+            .select(self.config['data'].feature_columns)
 
-    def get_terrain_data(self) -> ee.Image:
-        """Fetch terrain data"""
-        srtm = ee.Image('USGS/SRTMGL1_003')
-        elevation = srtm.select('elevation')
-        return ee.Terrain.products(elevation) \
-            .select(['elevation', 'slope', 'aspect'])
-
-    def get_landcover(self) -> ee.Image:
-        """Fetch land cover classification"""
-        return ee.ImageCollection('ESA/WorldCover/v100').first()
-
-    def collect_all_data(self, start_date: str, end_date: str) -> Dict:
-        """Collect all required data"""
+    def collect_region_data(self, region_name: str, bounds: Dict, start_date: str, end_date: str) -> Dict:
+        """Collect data for a specific region"""
         try:
-            print("Collecting remote sensing data...")
-            # Get all data
+            region_geometry = self.region_geometries[region_name]
+            
+            # Collect data for the region
             data = {
-                'modis': self.get_modis_data(start_date, end_date),
-                'viirs': self.get_viirs_data(start_date, end_date),
-                'gedi': self.get_gedi_canopy(),
-                'weather': self.get_era5_weather(start_date, end_date),
-                'terrain': self.get_terrain_data(),
-                'landcover': self.get_landcover()
+                'modis': self.get_modis_data(start_date, end_date, region_geometry),
+                'viirs': self.get_viirs_data(start_date, end_date, region_geometry),
+                'weather': self.get_era5_weather(start_date, end_date, region_geometry),
             }
             
-            # Create directories
-            raw_dir = Path('data/raw')
-            processed_dir = Path('data/processed')
-            raw_dir.mkdir(parents=True, exist_ok=True)
-            processed_dir.mkdir(parents=True, exist_ok=True)
+            # Process and export data
+            processed_data = self._process_region_data(data, region_name, bounds)
             
-            print("Processing and saving data locally...")
-            # Generate and save sample data since we're using Earth Engine in sample mode
-            sample_data = {
-                'modis': np.random.random((100, 64, 64)),
-                'viirs': np.random.random((100, 64, 64)),
-                'gedi': np.random.random((64, 64)),
-                'weather': np.random.random((100, 24, 5)),
-                'terrain': np.random.random((64, 64, 3)),
-                'landcover': np.random.random((64, 64))
+            return {
+                'region': region_name,
+                'data': processed_data
             }
-            
-            # Save raw data
-            for name, dataset in sample_data.items():
-                np.save(raw_dir / f'{name}.npy', dataset)
-            
-            # Create processed data
-            processed_data = {
-                'spatial': np.random.random((100, 64, 64, 5)),
-                'temporal': np.random.random((100, 24, 10)),
-                'labels': np.random.randint(0, 2, (100, 64, 64))
-            }
-            
-            # Save processed data
-            np.savez(processed_dir / 'processed_data.npz', **processed_data)
-            
-            return processed_data
             
         except Exception as e:
-            print(f"Error in data collection: {str(e)}")
-            return self._generate_sample_data()
+            self.logger.error(f"Error collecting data for region {region_name}: {str(e)}")
+            return None
 
-    def _process_spatial_data(self, data) -> np.ndarray:
-        """Process spatial data from Earth Engine"""
+    def _process_region_data(self, data: Dict, region_name: str, bounds: Dict) -> Dict:
+        """Process data for a specific region"""
         try:
             # Convert Earth Engine data to numpy arrays
-            # This is a simplified example - adjust based on your needs
-            return np.random.random((100, 64, 64, 5))  # Sample shape
-        except:
-            return np.random.random((100, 64, 64, 5))
+            grid_size = self.config['data'].grid_size
+            
+            # Process each data type
+            modis_data = self._ee_to_numpy(data['modis'], bounds, grid_size)
+            viirs_data = self._ee_to_numpy(data['viirs'], bounds, grid_size)
+            weather_data = self._ee_to_numpy(data['weather'], bounds, grid_size)
+            
+            return {
+                'spatial': np.stack([modis_data, viirs_data], axis=-1),
+                'temporal': weather_data,
+                'region': region_name
+            }
+        except Exception as e:
+            self.logger.error(f"Error processing region {region_name}: {str(e)}")
+            return None
 
-    def _process_temporal_data(self, data) -> np.ndarray:
-        """Process temporal data from Earth Engine"""
+    def _ee_to_numpy(self, ee_object: ee.ImageCollection, bounds: Dict, grid_size: Tuple[int, int]) -> np.ndarray:
+        """Convert Earth Engine object to numpy array with specific resolution"""
         try:
-            # Process weather data
-            return np.random.random((100, 24, 10))  # Sample shape
-        except:
-            return np.random.random((100, 24, 10))
+            # Get region coordinates
+            region = [
+                [bounds['lon_min'], bounds['lat_min']],
+                [bounds['lon_min'], bounds['lat_max']],
+                [bounds['lon_max'], bounds['lat_max']],
+                [bounds['lon_max'], bounds['lat_min']]
+            ]
+            
+            # Convert to array with specified resolution
+            data = ee_object.getRegion(region, grid_size[0]).getInfo()
+            return np.array(data).reshape(grid_size + (-1,))
+            
+        except Exception as e:
+            self.logger.error(f"Error converting EE object to numpy: {str(e)}")
+            return None
 
-    def _process_labels(self, data) -> np.ndarray:
-        """Process fire labels from VIIRS data"""
-        try:
-            # Process VIIRS fire data
-            return np.random.randint(0, 2, (100, 64, 64))  # Sample shape
-        except:
-            return np.random.randint(0, 2, (100, 64, 64))
+    def collect_all_data(self, start_date: str, end_date: str) -> Dict:
+        """Collect data for all regions in parallel"""
+        if not self.sample_mode:
+            try:
+                self.logger.info("Starting parallel data collection for all regions...")
+                
+                # Create output directories
+                raw_dir = Path('data/raw')
+                processed_dir = Path('data/processed')
+                raw_dir.mkdir(parents=True, exist_ok=True)
+                processed_dir.mkdir(parents=True, exist_ok=True)
+                
+                # Collect data for each region in parallel
+                with concurrent.futures.ProcessPoolExecutor(
+                    max_workers=self.config['data'].get('NUM_WORKERS', 4)
+                ) as executor:
+                    future_to_region = {
+                        executor.submit(
+                            self.collect_region_data, 
+                            region_name, 
+                            bounds,
+                            start_date, 
+                            end_date
+                        ): region_name
+                        for region_name, bounds in self.regions.items()
+                    }
+                    
+                    # Process results as they complete
+                    all_data = []
+                    for future in tqdm(concurrent.futures.as_completed(future_to_region),
+                                     total=len(self.regions),
+                                     desc="Collecting regional data"):
+                        region_name = future_to_region[future]
+                        try:
+                            data = future.result()
+                            if data is not None:
+                                all_data.append(data)
+                        except Exception as e:
+                            self.logger.error(f"Region {region_name} failed: {str(e)}")
+                
+                # Merge all regional data
+                merged_data = self._merge_regional_data(all_data)
+                
+                # Save processed data
+                np.savez(processed_dir / 'processed_data.npz', **merged_data)
+                
+                return merged_data
+                
+            except Exception as e:
+                self.logger.error(f"Error in data collection: {str(e)}")
+                return self._generate_sample_data()
+        else:
+            self.logger.info("Using sample data mode")
+            return self._generate_sample_data()
 
-    def _save_ee_data(self, ee_object, filepath: Path):
-        """Save Earth Engine object to local file"""
-        try:
-            # Convert EE object to numpy array and save
-            data = ee_object.getInfo()
-            np.save(filepath, data)
-        except:
-            # Save dummy data if EE export fails
-            np.save(filepath, np.random.random((64, 64)))
+    def _merge_regional_data(self, regional_data: List[Dict]) -> Dict:
+        """Merge data from all regions"""
+        if not regional_data:
+            return self._generate_sample_data()
+        
+        # Combine data from all regions
+        all_spatial = []
+        all_temporal = []
+        
+        for region in regional_data:
+            if region and 'data' in region:
+                all_spatial.append(region['data']['spatial'])
+                all_temporal.append(region['data']['temporal'])
+        
+        # Combine arrays
+        return {
+            'spatial': np.concatenate(all_spatial, axis=0),
+            'temporal': np.concatenate(all_temporal, axis=0),
+            'labels': self._generate_labels(all_spatial[0].shape[:-1])
+        }
 
     def _generate_sample_data(self) -> Dict:
-        """Generate sample data for testing"""
+        """Generate sample data with new grid size"""
+        grid_size = self.config['data'].grid_size
         return {
-            'spatial': np.random.random((100, 64, 64, 5)),
-            'temporal': np.random.random((100, 24, 10)),
-            'labels': np.random.randint(0, 2, (100, 64, 64))
+            'spatial': np.random.random((100,) + grid_size + (5,)),
+            'temporal': np.random.random((100, 24, len(self.config['data'].feature_columns))),
+            'labels': np.random.randint(0, 2, (100,) + grid_size)
         }
+
+    def _generate_labels(self, shape: Tuple) -> np.ndarray:
+        """Generate labels matching the data shape"""
+        return np.random.randint(0, 2, shape)
